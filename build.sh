@@ -6,7 +6,7 @@ target_os=${GOOS:-linux}
 target_arch=${GOARCH:-amd64}
 extension=''
 if [ "$target_os" = windows ]; then extension='.exe'; fi
-output=${1:-"$server_root/../artifacts/server/$target_os-$target_arch/embeddesk-server$extension"}
+output=${1:-"$server_root/artifacts/$target_os-$target_arch/embeddesk-server$extension"}
 (cd "$server_root/www" && npm ci && npm run build)
 test -f "$server_root/www/dist/index.html"
 mkdir -p "$(dirname -- "$output")"

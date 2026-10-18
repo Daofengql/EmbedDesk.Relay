@@ -1,4 +1,4 @@
-module embeddesk/relay
+module github.com/Daofengql/EmbedDesk.Relay
 
 go 1.26.9
 

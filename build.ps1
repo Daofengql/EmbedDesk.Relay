@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $serverRoot = $PSScriptRoot
 if (-not $Output) {
     $extension = if ($TargetOS -eq 'windows') { '.exe' } else { '' }
-    $Output = Join-Path $serverRoot "../artifacts/server/$TargetOS-$TargetArch/embeddesk-server$extension"
+    $Output = Join-Path $serverRoot "artifacts/$TargetOS-$TargetArch/embeddesk-server$extension"
 }
 $Output = [IO.Path]::GetFullPath($Output)
 $oldGoOS, $oldGoArch, $oldCgo = $env:GOOS, $env:GOARCH, $env:CGO_ENABLED

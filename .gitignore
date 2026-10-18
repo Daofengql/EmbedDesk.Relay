@@ -1,0 +1,24 @@
+# Local configuration and runtime state
+.env
+.env.*
+!.env.example
+relay.json
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Build output and local tooling
+artifacts/
+output/
+www/node_modules/
+www/*.tsbuildinfo
+www/dist/*
+!www/dist/.gitkeep
+
+# Operating-system/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

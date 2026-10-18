@@ -1,8 +1,10 @@
-# EmbedDesk 中继服务器与控制台
+# EmbedDesk.Relay 中继服务器与控制台
 
-Go / Gin / GORM 中继，配套 React / TypeScript / Ant Design 控制台。Go 项目在 `server/`，React 源码在 `server/www/`；HTML、JS、CSS、图标和许可通过 `go:embed` 嵌入服务端。Linux 产品交付为单个二进制，运行时不需要 Node、前端目录或桌面 .NET 环境。
+独立开源的 Go / Gin / GORM 中继，配套 React / TypeScript / Ant Design 控制台。React 源码在 `www/`；HTML、JS、CSS、图标和许可通过 `go:embed` 嵌入服务端。Linux 产品交付为单个二进制，运行时不需要 Node、前端目录或桌面 .NET 环境。
 
 生产推荐 MySQL 和 Redis，保留 SQLite 与数据库会话存储用于单机开发及桌面回归。服务只监听 HTTP，公网 HTTPS / WSS 由 Nginx 等反向代理提供。桌面协议和连接代码保持版本 1。
+
+Cloudflare Worker / Durable Objects 的边缘数据面设计见 [Cloudflare 中继方案](docs/CloudflareRelay.md)。当前仓库中的 Go 中继仍是完整实现；把 Cloudflare 放在 Go 服务前面只能代理流量，不能把 WebSocket 转发负载从 Go 服务卸载。真正卸载大头流量需要由 Worker / Durable Objects 终止并承载客户端 WebSocket。
 
 ## 准入、归属与带宽
 
@@ -41,23 +43,23 @@ Go / Gin / GORM 中继，配套 React / TypeScript / Ant Design 控制台。Go �
 开发需要 Go 1.26.9+、Node 22.12+（建议 24）和 npm。在仓库根运行：
 
 ```powershell
-./server/build.ps1
-./server/build.ps1 -TargetOS windows
+./build.ps1
+./build.ps1 -TargetOS windows
 ```
 
-默认成品为 `artifacts/server/linux-amd64/embeddesk-server`；显式指定 Windows 时为 `artifacts/server/windows-amd64/embeddesk-server.exe`。脚本执行 `npm ci`、TypeScript / Vite 构建、许可收集，再生成包含前端的单二进制。Linux / macOS 使用 `sh server/build.sh`，支持 `GOOS` / `GOARCH`。
+默认成品为 `artifacts/linux-amd64/embeddesk-server`；显式指定 Windows 时为 `artifacts/windows-amd64/embeddesk-server.exe`。脚本执行 `npm ci`、TypeScript / Vite 构建、许可收集，再生成包含前端的单二进制。Linux / macOS 使用 `sh build.sh`，支持 `GOOS` / `GOARCH`。
 
 Linux 虚拟机内手动执行顺序（仓库根目录）：
 
 ```sh
-cd server/www
+cd www
 npm ci
 npm run build
 cd ..
 go test ./...
 go vet ./...
-mkdir -p ../artifacts/server/linux-amd64
-CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o ../artifacts/server/linux-amd64/embeddesk-server .
+mkdir -p artifacts/linux-amd64
+CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o artifacts/linux-amd64/embeddesk-server .
 ```
 
 `www/dist/.gitkeep` 只保证干净检出的协议测试可以编译。普通 `go build` 不代表前端已构建，缺少前端时 `/console/` 返回 503；发布使用构建脚本。前端开发运行 `npm run dev`，Vite 将 `/api/console` 代理到本机 7080。
@@ -74,7 +76,7 @@ Bootstrap 仅在账号表为空时创建管理员，重启不重置密码。初�
 
 ## 部署
 
-推荐 MySQL、Redis、HTTPS 反向代理。在 `server/` 复制 `.env.example` 为 `.env`，替换占位值，运行 `docker compose up -d --build`。MySQL、Redis 不映射宿主端口，HTTP 只绑定宿主回环；中继容器使用非 root 用户。MySQL 密码须与 DSN 一致，Redis 密码须与 URL 一致，特殊字符按对应语法编码。
+推荐 MySQL、Redis、HTTPS 反向代理。在仓库根目录复制 `.env.example` 为 `.env`，替换占位值，运行 `docker compose up -d --build`。MySQL、Redis 不映射宿主端口，HTTP 只绑定宿主回环；中继容器使用非 root 用户。MySQL 密码须与 DSN 一致，Redis 密码须与 URL 一致，特殊字符按对应语法编码。
 
 也可由 Docker 直接暴露端口，无需修改宿主 Nginx：将 `.env` 中 `EMBEDDESK_BIND_ADDRESS` 设为 `0.0.0.0`、`EMBEDDESK_PORT` 设为所需端口，`EMBEDDESK_PUBLIC_URL` 填写对应的 `http://HOST:PORT`，并设 `EMBEDDESK_COOKIE_SECURE=false`。此方式为明文 HTTP，控制台登录和控制链路没有 TLS 保护；设备数据正文仍按既有协议加密。需要 HTTPS 时使用前述反向代理配置。默认注册关闭，开放注册需显式设置 `EMBEDDESK_REGISTRATION_ENABLED=true`。
 
@@ -121,7 +123,7 @@ CLI `--connection-code PUBLIC_URL NAME` 使用启动配置的 `admissionKey`，�
 - `POST /api/console/sessions/ID/close` 结束会话；`POST /api/console/devices/ID/disconnect` 断开设备；`DELETE /api/console/devices/ID` 删除登记。
 - `POST /api/console/users/batch`（管理员）可对当前选中的 1–100 个账号批量启用、禁用、设置账号总带宽或设备数量上限；`POST /api/console/devices/batch` 可批量启用、禁用、断开、删除或由管理员分配／清空归属；`POST /api/console/sessions/batch` 可批量关闭会话。批量请求整批校验，失败不产生部分修改；会话中已结束的 ID 返回 `skipped`。
 
-握手、加密转发、心跳和有界队列保持现有协议。连接方与被连接方互斥，待授权也占用角色：持有入站会话不能发起连接，持有出站会话的设备不能接受入站；相同方向允许多个会话，全部结束后可切换方向。最多 1,024 在线设备、4,096 设备会话、每设备 16 会话；待授权超时 90 秒。每设备三类队列各 64 项，报文最多 96 KiB、加密 body 最多 64 KiB。账号设备共享双向总限速，匿名设备各自限速；局域网直连不受中继配额限制。详见[设备协议](../docs/DeviceConnections.md)。
+握手、加密转发、心跳和有界队列保持现有协议。连接方与被连接方互斥，待授权也占用角色：持有入站会话不能发起连接，持有出站会话的设备不能接受入站；相同方向允许多个会话，全部结束后可切换方向。最多 1,024 在线设备、4,096 设备会话、每设备 16 会话；待授权超时 90 秒。每设备三类队列各 64 项，报文最多 96 KiB、加密 body 最多 64 KiB。账号设备共享双向总限速，匿名设备各自限速；局域网直连不受中继配额限制。详见[设备协议](docs/DeviceConnections.md)。
 
 ## 数据与边界
 
@@ -131,7 +133,7 @@ CLI `--connection-code PUBLIC_URL NAME` 使用启动配置的 `admissionKey`，�
 
 ## 验证与许可
 
-在 `server/` 运行 `go test ./...`、`go vet ./...`。`TestExternalMySQLRedis` 仅在提供 `EMBEDDESK_TEST_MYSQL_DSN`、`EMBEDDESK_TEST_REDIS_URL` 时执行；目标须为本次专用空数据库，Redis 使用随机前缀，不清理其他部署。Linux 虚拟机用于实际 MySQL / Redis 与单二进制验证，仓库不记录虚拟机账号、密码或私有网络地址。
+在仓库根目录运行 `go test ./...`、`go vet ./...`。`TestExternalMySQLRedis` 仅在提供 `EMBEDDESK_TEST_MYSQL_DSN`、`EMBEDDESK_TEST_REDIS_URL` 时执行；目标须为本次专用空数据库，Redis 使用随机前缀，不清理其他部署。Linux 虚拟机用于实际 MySQL / Redis 与单二进制验证，仓库不记录虚拟机账号、密码或私有网络地址。
 
 验证范围包括协议、三级权限、归属隔离、绑定、验证码一次性消费、CSRF、最后管理员保护、节点设置持久化、账号共享配额及会话关闭。桌面兼容检查先构建新的 `artifacts/relay-test.exe` 和独立 Smoke 项目，再运行 `--device-connections-check`、`--device-security-check`。编译不能代替浏览器操作和截图检查；实际执行结果、虚拟机互通、公网与硬件实测分别报告。
 
