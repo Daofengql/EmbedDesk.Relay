@@ -25,7 +25,7 @@ try {
     $env:GOOS, $env:GOARCH, $env:CGO_ENABLED = $TargetOS, $TargetArch, '0'
     Push-Location $serverRoot
     try {
-        go build -trimpath -ldflags '-s -w' -o $Output .
+        go build -trimpath -ldflags '-s -w' -o $Output ./cmd/relay
         if ($LASTEXITCODE -ne 0) { throw 'Server build failed' }
     } finally { Pop-Location }
     Write-Host "Built $Output (console and licenses embedded)"

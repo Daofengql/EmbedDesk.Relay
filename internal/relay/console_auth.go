@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
-package main
+package relay
 
 import (
 	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
-	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -19,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	consoleui "github.com/Daofengql/EmbedDesk.Relay/www"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
@@ -29,10 +29,7 @@ import (
 const consoleCookie = "embeddesk_console"
 const consoleSessionTTL = 12 * time.Hour
 
-// A tracked placeholder allows protocol-only builds; release builds run npm build first.
-//
-//go:embed all:www/dist
-var consoleAssets embed.FS
+var consoleAssets = consoleui.Files
 
 type User struct {
 	ID                     uint      `json:"id"`
@@ -255,7 +252,7 @@ func (a *Console) static(c *gin.Context) {
 		c.Status(404)
 		return
 	}
-	files, _ := fs.Sub(consoleAssets, "www/dist")
+	files, _ := fs.Sub(consoleAssets, "dist")
 	name := strings.TrimPrefix(c.Request.URL.Path, "/console/")
 	if name == "" {
 		name = "index.html"
@@ -273,7 +270,7 @@ func (a *Console) static(c *gin.Context) {
 		name = "index.html"
 	}
 	if _, err := fs.Stat(files, name); err != nil {
-		c.String(503, "Console assets unavailable. Run npm ci and npm run build in server/www, then rebuild the server.")
+		c.String(503, "Console assets unavailable. Run npm ci and npm run build in www, then rebuild the relay.")
 		return
 	}
 	c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")

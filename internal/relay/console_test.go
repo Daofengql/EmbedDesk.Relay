@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-package main
+package relay
 
 import (
 	"bytes"
@@ -474,8 +474,8 @@ func TestNodeSettingsPersistAcrossRestart(t *testing.T) {
 }
 
 func TestEmbeddedConsoleRoutes(t *testing.T) {
-	if _, err := fs.Stat(consoleAssets, "www/dist/index.html"); err != nil {
-		t.Skip("build server/www to verify embedded console")
+	if _, err := fs.Stat(consoleAssets, "dist/index.html"); err != nil {
+		t.Skip("build www to verify embedded console")
 	}
 	_, s, _ := consoleFixture(t)
 	for _, path := range []string{"/console", "/console/", "/console/index.html", "/console/devices"} {

@@ -4,7 +4,22 @@
 
 生产推荐 MySQL 和 Redis，保留 SQLite 与数据库会话存储用于单机开发及桌面回归。服务只监听 HTTP，公网 HTTPS / WSS 由 Nginx 等反向代理提供。桌面协议和连接代码保持版本 1。
 
+[在线部署文档](https://daofengql.github.io/EmbedDesk.Relay/)涵盖 Docker Compose、Nginx / 宝塔 HTTPS、Linux 单二进制与 systemd，以及配置、备份和升级。文档站使用 VitePress，由 GitHub Pages 自动发布。
+
 Cloudflare Worker / Durable Objects 的边缘数据面设计见 [Cloudflare 中继方案](docs/CloudflareRelay.md)。当前仓库中的 Go 中继仍是完整实现；把 Cloudflare 放在 Go 服务前面只能代理流量，不能把 WebSocket 转发负载从 Go 服务卸载。真正卸载大头流量需要由 Worker / Durable Objects 终止并承载客户端 WebSocket。
+
+## 项目结构
+
+```text
+cmd/relay/         命令行入口
+internal/relay/    配置、协议、控制台后端、存储与测试
+www/              React 控制台源码与构建资源嵌入包
+licenses/         原始许可证文本与嵌入包
+deploy/           Nginx、systemd 与二进制镜像部署示例
+docs/             部署、协议与架构文档
+```
+
+Go 命令入口为 `./cmd/relay`，内部实现不作为公共 Go SDK。前端产物仍输出至 `www/dist/`，构建后由资源包嵌入二进制。
 
 ## 准入、归属与带宽
 
@@ -59,10 +74,10 @@ cd ..
 go test ./...
 go vet ./...
 mkdir -p artifacts/linux-amd64
-CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o artifacts/linux-amd64/embeddesk-server .
+CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o artifacts/linux-amd64/embeddesk-server ./cmd/relay
 ```
 
-`www/dist/.gitkeep` 只保证干净检出的协议测试可以编译。普通 `go build` 不代表前端已构建，缺少前端时 `/console/` 返回 503；发布使用构建脚本。前端开发运行 `npm run dev`，Vite 将 `/api/console` 代理到本机 7080。
+`www/dist/.gitkeep` 只保证干净检出的协议测试可以编译。普通 `go build ./cmd/relay` 不代表前端已构建，缺少前端时 `/console/` 返回 503；发布使用构建脚本。前端开发运行 `npm run dev`，Vite 将 `/api/console` 代理到本机 7080。
 
 ## 首次启动与配置优先级
 

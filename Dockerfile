@@ -12,7 +12,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=console /src/www/dist ./www/dist
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/embeddesk-server . && mkdir /out/data
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/embeddesk-server ./cmd/relay && mkdir /out/data
 
 FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app

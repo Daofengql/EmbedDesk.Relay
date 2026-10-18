@@ -1,6 +1,14 @@
+.git
+artifacts
+output
+.playwright-cli
 www/node_modules
 www/dist
 www/*.tsbuildinfo
+node_modules
+docs/.vitepress/cache
+docs/.vitepress/dist
+backups
 data
 relay.json
 .env

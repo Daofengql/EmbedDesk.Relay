@@ -11,6 +11,11 @@ data/
 # Build output and local tooling
 artifacts/
 output/
+.playwright-cli/
+backups/
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
 www/node_modules/
 www/*.tsbuildinfo
 www/dist/*

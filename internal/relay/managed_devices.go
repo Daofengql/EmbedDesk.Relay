@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-package main
+package relay
 
 import (
 	"crypto/subtle"
