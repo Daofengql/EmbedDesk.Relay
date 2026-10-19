@@ -250,4 +250,4 @@ curl --fail --silent --show-error http://127.0.0.1:7080/ready
 
 当前上限包括 1024 个在线设备、4096 个设备会话、每设备 16 个会话，并为报文和队列设限。这些是保护上限，不是当前主机必然可以承载的性能承诺。
 
-Redis 不提供跨实例路由，不能直接把多个进程放进随机负载均衡。希望 Cloudflare 承担数据面需要另一种实现；普通 CDN 代理不会卸载 Go 转发流量。详见[设备协议边界](../DeviceConnections.md)与[Cloudflare 设计](../CloudflareRelay.md)。
+Redis 不提供跨实例路由，不能直接把多个进程放进随机负载均衡；普通反向代理也不会卸载 Go 进程的 WebSocket 转发负载。详见[设备协议边界](../DeviceConnections.md)。

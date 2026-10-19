@@ -165,4 +165,4 @@ curl --fail --silent --show-error https://HOST/ready
 
 当前设备、会话和账号共享限速在单进程内存中，共用 MySQL / Redis 不会形成集群。随机负载均衡会让相关设备落到不同进程，不能直接扩容。
 
-GitHub / Cloudflare Pages 只能托管静态内容。Cloudflare 普通代理仍把数据交给 Go，源站流量不会因此消失。Worker / Durable Objects 直接承载 WebSocket 才能卸载数据面，当前仅有[设计方案](../CloudflareRelay.md)。
+GitHub / Cloudflare Pages 只能托管静态内容。反向代理只转发请求，不会把中继的连接管理和 WebSocket 数据处理从 Go 源站移走；中继仍需要运行在服务器上。

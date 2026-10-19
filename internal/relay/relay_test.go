@@ -216,6 +216,11 @@ func TestConnectionRoleExclusion(t *testing.T) {
 	closeSession(3, 1, secondInitiator)
 	reversed := connect(1, 0)
 	closeSession(1, 0, reversed)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.sessions) != 0 || len(r.pendingSessions) != 0 || len(r.sessionOrigins) != 0 || len(r.sessionOwners) != 0 || len(r.deviceSessions) != 0 || len(r.sessionIDsByDevice) != 0 {
+		t.Fatal("session indexes were not released after closing all sessions")
+	}
 }
 
 func TestAggregateBudgetAndPendingExpiry(t *testing.T) {
@@ -225,15 +230,43 @@ func TestAggregateBudgetAndPendingExpiry(t *testing.T) {
 	}
 	defer r.close()
 	r.mu.Lock()
-	r.sessions["expired"] = &session{origin: "a", owner: "b", expires: time.Now().Add(-time.Second)}
+	r.addSessionLocked("expired", &session{origin: "a", owner: "b", expires: time.Now().Add(-time.Second)})
 	r.mu.Unlock()
-	time.Sleep(1100 * time.Millisecond)
-	r.mu.Lock()
-	_, exists := r.sessions["expired"]
-	r.mu.Unlock()
-	if exists {
-		t.Fatal("pending session leak")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.RLock()
+		_, exists := r.sessions["expired"]
+		r.mu.RUnlock()
+		if !exists {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.sessions) != 0 || len(r.pendingSessions) != 0 || len(r.sessionOrigins) != 0 || len(r.sessionOwners) != 0 || len(r.deviceSessions) != 0 || len(r.sessionIDsByDevice) != 0 {
+		t.Fatal("pending session or its indexes leaked after expiry")
+	}
+}
+
+func BenchmarkRouteDataParallel(b *testing.B) {
+	target := &peer{id: "target", dataOut: make(chan Message, 256), done: make(chan struct{})}
+	source := &peer{id: "source", done: make(chan struct{})}
+	r := &Relay{
+		peers:    map[string]*peer{"source": source, "target": target},
+		sessions: map[string]*session{"00000000000000000000000000000000": {origin: "source", owner: "target", accepted: true}},
+	}
+	body := json.RawMessage(`"` + strings.Repeat("x", 1024) + `"`)
+	m := Message{Type: "data", Session: "00000000000000000000000000000000", Body: body}
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			r.routeData(source, m)
+			<-target.dataOut
+		}
+	})
 }
 
 func TestAggregateBidirectionalRate(t *testing.T) {

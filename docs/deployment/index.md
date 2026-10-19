@@ -14,7 +14,7 @@
 | 本机开发、协议回归 | [构建与验证](../development/index.md) | 本机回环地址 |
 
 ::: tip 读文档和运行中继是两件事
-GitHub Pages 托管的是这份静态部署文档。它不能运行 Go 程序、数据库或当前有状态的 WebSocket 中继。Cloudflare Worker / Durable Objects 版也仍是[设计方案](../CloudflareRelay.md)。
+GitHub Pages 只托管这份静态部署文档；Go 中继、数据库和有状态的 WebSocket 服务需要运行在服务器上。
 :::
 
 ## 部署前准备

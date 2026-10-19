@@ -16,22 +16,6 @@ func (r *Relay) admissionAllowed(raw string) bool {
 	configured := r.node.Load().AdmissionKey
 	return configured == "" || subtle.ConstantTimeCompare([]byte(raw), []byte(configured)) == 1
 }
-func (r *Relay) devicePolicy(d Device) (int64, error) {
-	if d.Disabled {
-		return 0, errPolicy
-	}
-	if d.OwnerID == nil {
-		return r.node.Load().DefaultBandwidthBitsPerSecond, nil
-	}
-	if r.console == nil {
-		return 0, errPolicy
-	}
-	var u User
-	if r.db.First(&u, *d.OwnerID).Error != nil || u.Disabled {
-		return 0, errPolicy
-	}
-	return u.BandwidthBitsPerSecond, nil
-}
 
 // Registration proves possession of the stable random device credential, not account ownership.
 // Administrators assign ownership separately; registration cannot transfer it.

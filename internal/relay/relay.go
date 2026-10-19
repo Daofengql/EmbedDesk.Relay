@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -24,6 +25,17 @@ const maxMessage = 96 * 1024
 const defaultBandwidthBitsPerSecond int64 = 1_000_000
 const minBandwidthBitsPerSecond int64 = 8_000
 const maxBandwidthBitsPerSecond int64 = 100_000_000_000
+
+const (
+	// Keep these values aligned with the client receive idle window. A write is
+	// sent as several WebSocket fragments so an upstream proxy's per-connection
+	// rate limit can make progress without holding one deadline for the whole
+	// message.
+	websocketReadIdleTimeout  = 75 * time.Second
+	websocketWriteIdleTimeout = 75 * time.Second
+	websocketPingInterval     = 25 * time.Second
+	websocketWriteChunkSize   = 4 * 1024
+)
 
 type Device struct {
 	ID             string `gorm:"primaryKey;size:24"`
@@ -54,13 +66,25 @@ type peer struct {
 	dataIn    chan Message
 	done      chan struct{}
 	once      sync.Once
+	ctx       context.Context
+	cancel    context.CancelFunc
 	budget    *rate.Limiter
 	control   *rate.Limiter
 	written   chan struct{}
 	processed chan struct{}
 }
 
-func (p *peer) stop() { p.once.Do(func() { close(p.done); _ = p.socket.Close() }) }
+func (p *peer) stop() {
+	p.once.Do(func() {
+		close(p.done)
+		if p.cancel != nil {
+			p.cancel()
+		}
+		if p.socket != nil {
+			_ = p.socket.Close()
+		}
+	})
+}
 func (p *peer) send(m Message) bool {
 	select {
 	case <-p.done:
@@ -88,23 +112,28 @@ type session struct {
 	createdAt     time.Time
 }
 type Relay struct {
-	db              *gorm.DB
-	mu              sync.Mutex
-	peers           map[string]*peer
-	sessions        map[string]*session
-	closed          bool
-	admissionBudget *rate.Limiter
-	stop            chan struct{}
-	once            sync.Once
-	workers         sync.WaitGroup
-	policyMu        sync.Mutex // Serialize registration, admission and policy changes.
-	config          RelayConfig
-	console         *Console
-	startedAt       time.Time
-	node            atomic.Pointer[NodeSettings]
-	metrics         atomic.Pointer[ServerMetrics]
-	receivedBytes   atomic.Uint64
-	sentBytes       atomic.Uint64
+	db                 *gorm.DB
+	mu                 sync.RWMutex
+	peers              map[string]*peer
+	sessions           map[string]*session
+	pendingSessions    map[string]struct{}
+	sessionOrigins     map[string]int
+	sessionOwners      map[string]int
+	deviceSessions     map[string]int
+	sessionIDsByDevice map[string]map[string]struct{}
+	closed             bool
+	admissionBudget    *rate.Limiter
+	stop               chan struct{}
+	once               sync.Once
+	workers            sync.WaitGroup
+	policyMu           sync.RWMutex // Policy changes exclude new sessions; peers may authenticate concurrently.
+	config             RelayConfig
+	console            *Console
+	startedAt          time.Time
+	node               atomic.Pointer[NodeSettings]
+	metrics            atomic.Pointer[ServerMetrics]
+	receivedBytes      atomic.Uint64
+	sentBytes          atomic.Uint64
 }
 
 func newRelay(path, admission string) (*Relay, error) {
@@ -127,7 +156,13 @@ func newRelayWithConfig(config RelayConfig) (*Relay, error) {
 		_ = sqlDB.Close()
 		return nil, err
 	}
-	r := &Relay{db: db, peers: make(map[string]*peer), sessions: make(map[string]*session), admissionBudget: rate.NewLimiter(20, 40), stop: make(chan struct{}), config: config, startedAt: time.Now()}
+	r := &Relay{
+		db: db, peers: make(map[string]*peer), sessions: make(map[string]*session),
+		pendingSessions: make(map[string]struct{}),
+		sessionOrigins:  make(map[string]int), sessionOwners: make(map[string]int),
+		deviceSessions: make(map[string]int), sessionIDsByDevice: make(map[string]map[string]struct{}),
+		admissionBudget: rate.NewLimiter(20, 40), stop: make(chan struct{}), config: config, startedAt: time.Now(),
+	}
 	settings := initialNodeSettings(config)
 	r.node.Store(&settings)
 	if config.ConsoleEnabled {
@@ -156,16 +191,7 @@ func newRelayWithConfig(config RelayConfig) (*Relay, error) {
 					r.sampleTelemetry(telemetry)
 				}
 				r.mu.Lock()
-				for id, s := range r.sessions {
-					if !s.accepted && time.Now().After(s.expires) {
-						for _, device := range []string{s.owner, s.origin} {
-							if p := r.peers[device]; p != nil {
-								p.send(Message{Type: "close", Session: id, Error: "authorization expired"})
-							}
-						}
-						delete(r.sessions, id)
-					}
-				}
+				r.expirePendingSessionsLocked(time.Now(), true)
 				r.mu.Unlock()
 			}
 		}
@@ -209,15 +235,53 @@ func (r *Relay) authenticate(c *gin.Context) (string, bool) {
 		return "", false
 	}
 	var device Device
-	if err := r.db.Where("id = ? AND credential_hash = ?", c.GetHeader("X-Device-ID"), hashCredential(value)).First(&device).Error; err != nil {
-		c.JSON(401, gin.H{"error": "device authentication failed"})
-		return "", false
+	var bits int64
+	if r.console != nil {
+		var row struct {
+			ID             string `gorm:"column:id"`
+			OwnerID        *uint  `gorm:"column:owner_id"`
+			Disabled       bool   `gorm:"column:disabled"`
+			OwnerDisabled  *bool  `gorm:"column:owner_disabled"`
+			OwnerBandwidth *int64 `gorm:"column:owner_bandwidth_bits_per_second"`
+		}
+		err := r.db.Table("devices AS d").
+			Select("d.id, d.owner_id, d.disabled, u.disabled AS owner_disabled, u.bandwidth_bits_per_second AS owner_bandwidth_bits_per_second").
+			Joins("LEFT JOIN users AS u ON u.id = d.owner_id").
+			Where("d.id = ? AND d.credential_hash = ?", c.GetHeader("X-Device-ID"), hashCredential(value)).
+			Take(&row).Error
+		if err != nil {
+			c.JSON(401, gin.H{"error": "device authentication failed"})
+			return "", false
+		}
+		device = Device{ID: row.ID, OwnerID: row.OwnerID, Disabled: row.Disabled}
+		if device.Disabled || (device.OwnerID != nil && (row.OwnerDisabled == nil || *row.OwnerDisabled || row.OwnerBandwidth == nil)) {
+			c.JSON(403, gin.H{"error": "device or owner is disabled"})
+			return "", false
+		}
+		bits = r.node.Load().DefaultBandwidthBitsPerSecond
+		if device.OwnerID != nil {
+			bits = *row.OwnerBandwidth
+		}
+	} else {
+		err := r.db.Select("id", "credential_hash", "owner_id", "disabled").
+			Where("id = ? AND credential_hash = ?", c.GetHeader("X-Device-ID"), hashCredential(value)).
+			First(&device).Error
+		if err != nil {
+			c.JSON(401, gin.H{"error": "device authentication failed"})
+			return "", false
+		}
+		if device.Disabled || device.OwnerID != nil {
+			c.JSON(403, gin.H{"error": "device or owner is disabled"})
+			return "", false
+		}
+		bits = r.node.Load().DefaultBandwidthBitsPerSecond
 	}
-	if _, err := r.devicePolicy(device); err != nil {
+	if bits <= 0 {
 		c.JSON(403, gin.H{"error": "device or owner is disabled"})
 		return "", false
 	}
 	c.Set("device", device)
+	c.Set("deviceBandwidthBitsPerSecond", bits)
 	return device.ID, true
 }
 func (r *Relay) register(c *gin.Context) {
@@ -252,43 +316,39 @@ func (r *Relay) lookup(c *gin.Context) {
 	if _, ok := r.authenticate(c); !ok {
 		return
 	}
-	r.mu.Lock()
+	r.mu.RLock()
 	_, online := r.peers[c.Param("id")]
-	r.mu.Unlock()
+	r.mu.RUnlock()
 	c.JSON(200, gin.H{"id": c.Param("id"), "online": online})
 }
 
-var upgrade = websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, HandshakeTimeout: 10 * time.Second,
+var upgrade = websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, WriteBufferPool: &sync.Pool{}, HandshakeTimeout: 10 * time.Second,
 	CheckOrigin: func(req *http.Request) bool { return req.Header.Get("Origin") == "" }}
 
 func (r *Relay) channel(c *gin.Context) {
-	r.policyMu.Lock()
+	r.policyMu.RLock()
 	id, ok := r.authenticate(c)
 	if !ok {
-		r.policyMu.Unlock()
+		r.policyMu.RUnlock()
 		return
 	}
 	device := c.MustGet("device").(Device)
-	bits, policyErr := r.devicePolicy(device)
-	if policyErr != nil {
-		r.policyMu.Unlock()
-		c.JSON(403, gin.H{"error": "device or owner is disabled"})
-		return
-	}
+	bits := c.MustGet("deviceBandwidthBitsPerSecond").(int64)
 	socket, err := upgrade.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		r.policyMu.Unlock()
+		r.policyMu.RUnlock()
 		return
 	}
 	bytesPerSecond := float64(bits) / 8
-	p := &peer{id: id, socket: socket, out: make(chan Message, 64), dataOut: make(chan Message, 64), dataIn: make(chan Message, 64), done: make(chan struct{}), written: make(chan struct{}), processed: make(chan struct{}), budget: rate.NewLimiter(rate.Limit(bytesPerSecond), 64*1024), control: rate.NewLimiter(20, 40)}
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &peer{id: id, socket: socket, out: make(chan Message, 64), dataOut: make(chan Message, 64), dataIn: make(chan Message, 64), done: make(chan struct{}), ctx: ctx, cancel: cancel, written: make(chan struct{}), processed: make(chan struct{}), control: rate.NewLimiter(20, 40)}
 	if device.OwnerID != nil {
 		p.ownerID = *device.OwnerID
 	}
 	r.mu.Lock()
 	if r.closed || len(r.peers) >= 1024 || r.peers[id] != nil {
 		r.mu.Unlock()
-		r.policyMu.Unlock()
+		r.policyMu.RUnlock()
 		p.stop()
 		return
 	}
@@ -308,25 +368,31 @@ func (r *Relay) channel(c *gin.Context) {
 			break
 		}
 	}
+	if p.budget == nil {
+		p.budget = rate.NewLimiter(rate.Limit(bytesPerSecond), 64*1024)
+	}
 	r.peers[id] = p
 	r.workers.Add(1)
 	r.mu.Unlock()
-	r.policyMu.Unlock()
+	r.policyMu.RUnlock()
 	defer r.remove(p)
 	defer r.workers.Done()
 	socket.SetReadLimit(maxMessage)
-	_ = socket.SetReadDeadline(time.Now().Add(75 * time.Second))
-	socket.SetPongHandler(func(string) error { return socket.SetReadDeadline(time.Now().Add(75 * time.Second)) })
+	_ = socket.SetReadDeadline(time.Now().Add(websocketReadIdleTimeout))
+	socket.SetPongHandler(func(string) error { return socket.SetReadDeadline(time.Now().Add(websocketReadIdleTimeout)) })
+	socket.SetPingHandler(func(payload string) error {
+		return socket.WriteControl(websocket.PongMessage, []byte(payload), time.Now().Add(websocketWriteIdleTimeout))
+	})
 	go r.writeLoop(p)
 	go r.processData(p)
 	defer func() { p.stop(); <-p.written; <-p.processed }()
 	p.send(Message{Type: "online", From: id})
 	for {
 		var m Message
-		if err = socket.ReadJSON(&m); err != nil {
+		if err = readJSONWithProgress(socket, &m); err != nil {
 			return
 		}
-		_ = socket.SetReadDeadline(time.Now().Add(75 * time.Second))
+		_ = socket.SetReadDeadline(time.Now().Add(websocketReadIdleTimeout))
 		if m.Type != "data" && !p.control.Allow() {
 			return
 		}
@@ -349,23 +415,39 @@ func (r *Relay) channel(c *gin.Context) {
 		r.route(p, m)
 	}
 }
+
+type progressReader struct {
+	socket *websocket.Conn
+	reader io.Reader
+}
+
+func (r progressReader) Read(data []byte) (int, error) {
+	n, err := r.reader.Read(data)
+	if n > 0 {
+		_ = r.socket.SetReadDeadline(time.Now().Add(websocketReadIdleTimeout))
+	}
+	return n, err
+}
+
+// readJSONWithProgress preserves the existing single JSON text message while
+// extending the read deadline whenever a slow peer delivers more bytes. The
+// WebSocket read limit still bounds the complete message.
+func readJSONWithProgress(socket *websocket.Conn, value any) error {
+	_, reader, err := socket.NextReader()
+	if err != nil {
+		return err
+	}
+	return json.NewDecoder(progressReader{socket: socket, reader: reader}).Decode(value)
+}
+
 func (r *Relay) processData(p *peer) {
 	defer close(p.processed)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		select {
-		case <-p.done:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
 	for {
 		select {
 		case <-p.done:
 			return
 		case m := <-p.dataIn:
-			if p.budget.WaitN(ctx, len(m.Body)) != nil {
+			if p.budget.WaitN(p.ctx, len(m.Body)) != nil {
 				return
 			}
 			r.route(p, m)
@@ -374,12 +456,16 @@ func (r *Relay) processData(p *peer) {
 }
 func (r *Relay) writeLoop(p *peer) {
 	defer close(p.written)
-	ticker := time.NewTicker(25 * time.Second)
+	ticker := time.NewTicker(websocketPingInterval)
 	defer ticker.Stop()
 	defer p.stop()
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
 	write := func(m Message) bool {
-		_ = p.socket.SetWriteDeadline(time.Now().Add(15 * time.Second))
-		if p.socket.WriteJSON(m) != nil {
+		if writeJSONWithProgress(p.socket, m) != nil {
 			return false
 		}
 		if m.Type == "data" {
@@ -416,7 +502,14 @@ func (r *Relay) writeLoop(p *peer) {
 			if !reservation.OK() {
 				return
 			}
-			timer := time.NewTimer(reservation.Delay())
+			delay := reservation.Delay()
+			if delay <= 0 {
+				if !write(m) {
+					return
+				}
+				continue
+			}
+			timer.Reset(delay)
 			ready := false
 			for !ready {
 				select {
@@ -446,14 +539,48 @@ func (r *Relay) writeLoop(p *peer) {
 		}
 	}
 }
+
+// writeJSONWithProgress keeps the wire-level JSON message unchanged while
+// allowing the WebSocket transport to fragment large messages. Nginx and
+// other reverse proxies may apply a per-connection response limit; a single
+// WriteJSON call would apply one deadline to the entire message and could
+// close an otherwise healthy connection before a throttled link finishes it.
+// Each fragment gets a fresh idle deadline, while the caller's bounded queue
+// still provides backpressure for a receiver that stops consuming data.
+func writeJSONWithProgress(socket *websocket.Conn, message Message) error {
+	payload, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	// WriteJSON uses Encoder.Encode, which terminates every JSON message with a
+	// newline. Preserve that exact framing detail for existing peers.
+	payload = append(payload, '\n')
+	writer, err := socket.NextWriter(websocket.TextMessage)
+	if err != nil {
+		return err
+	}
+	for len(payload) > 0 {
+		n := websocketWriteChunkSize
+		if len(payload) < n {
+			n = len(payload)
+		}
+		_ = socket.SetWriteDeadline(time.Now().Add(websocketWriteIdleTimeout))
+		if _, err := writer.Write(payload[:n]); err != nil {
+			_ = writer.Close()
+			return err
+		}
+		payload = payload[n:]
+	}
+	_ = socket.SetWriteDeadline(time.Now().Add(websocketWriteIdleTimeout))
+	return writer.Close()
+}
 func (r *Relay) route(p *peer, m Message) {
+	if m.Type == "data" {
+		r.routeData(p, m)
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for id, s := range r.sessions {
-		if !s.accepted && time.Now().After(s.expires) {
-			delete(r.sessions, id)
-		}
-	}
 	fail := func(reason string) {
 		response := Message{Type: "error", Session: m.Session, Error: reason}
 		if m.Type == "connect" {
@@ -467,6 +594,9 @@ func (r *Relay) route(p *peer, m Message) {
 		p.send(response)
 	}
 	if m.Type == "connect" {
+		now := time.Now()
+		r.expireDeviceSessionsLocked(p.id, now)
+		r.expireDeviceSessionsLocked(m.To, now)
 		target := r.peers[m.To]
 		if target == nil || m.To == p.id {
 			fail("target offline or invalid")
@@ -476,24 +606,15 @@ func (r *Relay) route(p *peer, m Message) {
 			fail("session capacity reached")
 			return
 		}
-		count, targetCount := 0, 0
-		for _, s := range r.sessions {
-			if s.owner == p.id {
-				fail("当前作为被连接方，不能发起连接；请先结束入站连接或待授权请求。")
-				return
-			}
-			if s.origin == m.To {
-				fail("对方当前作为连接发起方，暂不接受入站连接。")
-				return
-			}
-			if s.origin == p.id || s.owner == p.id {
-				count++
-			}
-			if s.origin == m.To || s.owner == m.To {
-				targetCount++
-			}
+		if r.sessionOwners[p.id] > 0 {
+			fail("当前作为被连接方，不能发起连接；请先结束入站连接或待授权请求。")
+			return
 		}
-		if count >= 16 || targetCount >= 16 {
+		if r.sessionOrigins[m.To] > 0 {
+			fail("对方当前作为连接发起方，暂不接受入站连接。")
+			return
+		}
+		if r.deviceSessions[p.id] >= 16 || r.deviceSessions[m.To] >= 16 {
 			fail("device session capacity reached")
 			return
 		}
@@ -503,16 +624,20 @@ func (r *Relay) route(p *peer, m Message) {
 			return
 		}
 		m.Session = hex.EncodeToString(sid)
-		r.sessions[m.Session] = &session{origin: p.id, owner: m.To, expires: time.Now().Add(90 * time.Second), createdAt: time.Now().UTC()}
+		r.addSessionLocked(m.Session, &session{origin: p.id, owner: m.To, expires: time.Now().Add(90 * time.Second), createdAt: time.Now().UTC()})
 		m.From = p.id
 		if !target.send(m) {
-			delete(r.sessions, m.Session)
+			r.removeSessionLocked(m.Session)
 			fail("target unavailable")
 		}
 		p.send(Message{Type: "pending", Session: m.Session, Body: m.Body})
 		return
 	}
 	s := r.sessions[m.Session]
+	if s != nil && !s.accepted && time.Now().After(s.expires) {
+		r.removeSessionLocked(m.Session)
+		s = nil
+	}
 	if s == nil && (m.Type == "close" || m.Type == "data") {
 		return
 	} // Close is idempotent; queued data for an ended session must not create a spurious error.
@@ -526,7 +651,7 @@ func (r *Relay) route(p *peer, m Message) {
 	}
 	target := r.peers[targetID]
 	if target == nil {
-		delete(r.sessions, m.Session)
+		r.removeSessionLocked(m.Session)
 		fail("peer disconnected")
 		return
 	}
@@ -550,6 +675,7 @@ func (r *Relay) route(p *peer, m Message) {
 			}
 			s.accepted = true
 			s.stage = 3
+			delete(r.pendingSessions, m.Session)
 		}
 	case "proof":
 		if p.id != s.origin {
@@ -567,13 +693,13 @@ func (r *Relay) route(p *peer, m Message) {
 			return
 		}
 	case "close":
-		delete(r.sessions, m.Session)
+		r.removeSessionLocked(m.Session)
 	default:
 		fail("unsupported message")
 		return
 	}
 	if !s.accepted && time.Now().After(s.expires) {
-		delete(r.sessions, m.Session)
+		r.removeSessionLocked(m.Session)
 		fail("authorization expired")
 		return
 	}
@@ -583,6 +709,142 @@ func (r *Relay) route(p *peer, m Message) {
 		r.receivedBytes.Add(uint64(len(m.Body)))
 	}
 }
+
+// routeData is the high-volume path. Session lookup and forwarding only read shared
+// routing state, so concurrent streams do not serialize behind control messages.
+func (r *Relay) routeData(p *peer, m Message) {
+	r.mu.RLock()
+	s := r.sessions[m.Session]
+	if s == nil {
+		r.mu.RUnlock()
+		return
+	}
+	fail := func(reason string) {
+		p.send(Message{Type: "error", Session: m.Session, Error: reason})
+	}
+	if s.origin != p.id && s.owner != p.id {
+		r.mu.RUnlock()
+		fail("session unavailable")
+		return
+	}
+	if !s.accepted {
+		expired := time.Now().After(s.expires)
+		r.mu.RUnlock()
+		if expired {
+			r.mu.Lock()
+			if r.sessions[m.Session] == s {
+				r.removeSessionLocked(m.Session)
+			}
+			r.mu.Unlock()
+			return
+		}
+		fail("session not authorized")
+		return
+	}
+	targetID := s.owner
+	if p.id == s.owner {
+		targetID = s.origin
+	}
+	target := r.peers[targetID]
+	if target == nil {
+		r.mu.RUnlock()
+		r.mu.Lock()
+		if r.sessions[m.Session] == s {
+			r.removeSessionLocked(m.Session)
+		}
+		r.mu.Unlock()
+		fail("peer disconnected")
+		return
+	}
+	m.From = p.id
+	m.To = targetID
+	if target.send(m) && m.Type == "data" {
+		r.receivedBytes.Add(uint64(len(m.Body)))
+	}
+	r.mu.RUnlock()
+}
+
+func (r *Relay) addSessionLocked(id string, s *session) {
+	r.sessions[id] = s
+	r.pendingSessions[id] = struct{}{}
+	for _, device := range []string{s.origin, s.owner} {
+		ids := r.sessionIDsByDevice[device]
+		if ids == nil {
+			ids = make(map[string]struct{})
+			r.sessionIDsByDevice[device] = ids
+		}
+		ids[id] = struct{}{}
+		r.deviceSessions[device]++
+	}
+	r.sessionOrigins[s.origin]++
+	r.sessionOwners[s.owner]++
+}
+
+func (r *Relay) removeSessionLocked(id string) *session {
+	s := r.sessions[id]
+	if s == nil {
+		return nil
+	}
+	delete(r.sessions, id)
+	delete(r.pendingSessions, id)
+	if r.sessionOrigins[s.origin] <= 1 {
+		delete(r.sessionOrigins, s.origin)
+	} else {
+		r.sessionOrigins[s.origin]--
+	}
+	if r.sessionOwners[s.owner] <= 1 {
+		delete(r.sessionOwners, s.owner)
+	} else {
+		r.sessionOwners[s.owner]--
+	}
+	for _, device := range []string{s.origin, s.owner} {
+		if r.deviceSessions[device] <= 1 {
+			delete(r.deviceSessions, device)
+		} else {
+			r.deviceSessions[device]--
+		}
+		if ids := r.sessionIDsByDevice[device]; ids != nil {
+			delete(ids, id)
+			if len(ids) == 0 {
+				delete(r.sessionIDsByDevice, device)
+			}
+		}
+	}
+	return s
+}
+
+func (r *Relay) expirePendingSessionsLocked(now time.Time, notify bool) {
+	for id := range r.pendingSessions {
+		s := r.sessions[id]
+		if s == nil || now.Before(s.expires) {
+			continue
+		}
+		r.removeSessionLocked(id)
+		if notify {
+			for _, device := range []string{s.owner, s.origin} {
+				if p := r.peers[device]; p != nil {
+					p.send(Message{Type: "close", Session: id, Error: "authorization expired"})
+				}
+			}
+		}
+	}
+}
+
+func (r *Relay) expireDeviceSessionsLocked(device string, now time.Time) {
+	for id := range r.sessionIDsByDevice[device] {
+		s := r.sessions[id]
+		if s == nil || s.accepted || now.Before(s.expires) {
+			continue
+		}
+		r.removeSessionLocked(id)
+		for _, participant := range []string{s.owner, s.origin} {
+			if p := r.peers[participant]; p != nil {
+				p.send(Message{Type: "close", Session: id, Error: "authorization expired"})
+			}
+		}
+	}
+}
+
 func (r *Relay) remove(p *peer) {
 	p.stop()
 	r.mu.Lock()
@@ -591,8 +853,9 @@ func (r *Relay) remove(p *peer) {
 		return
 	}
 	delete(r.peers, p.id)
-	for id, s := range r.sessions {
-		if s.origin == p.id || s.owner == p.id {
+	for id := range r.sessionIDsByDevice[p.id] {
+		s := r.removeSessionLocked(id)
+		if s != nil {
 			other := s.owner
 			if other == p.id {
 				other = s.origin
@@ -600,7 +863,6 @@ func (r *Relay) remove(p *peer) {
 			if q := r.peers[other]; q != nil {
 				q.send(Message{Type: "close", Session: id, Error: "peer disconnected"})
 			}
-			delete(r.sessions, id)
 		}
 	}
 }

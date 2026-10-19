@@ -268,7 +268,7 @@ func (a *Console) batchSessions(c *gin.Context) {
 		if a.r.sessions[id] != s {
 			continue
 		}
-		delete(a.r.sessions, id)
+		a.r.removeSessionLocked(id)
 		affected++
 		for _, device := range []string{s.origin, s.owner} {
 			if p := a.r.peers[device]; p != nil {

@@ -78,7 +78,6 @@ flowchart LR
 | 使用已有 MySQL / Redis，偏好 Linux 服务管理 | [单二进制与 systemd](deployment/binary.md) | 环境文件权限、systemd 日志、就绪接口 |
 | 仅在可信内网临时验证 | [Docker 直接暴露端口](deployment/docker.md#直接暴露-docker-端口) | HTTP / WS 与 Cookie 设置保持一致 |
 | 修改 Go 协议或 React 控制台 | [构建与验证](development/index.md) | 自动测试、构建产物、浏览器操作 |
-| 希望把大头转发流量交给 Cloudflare | [Worker / Durable Objects 方案](CloudflareRelay.md) | 先了解当前实现状态与数据路径 |
 
 ## 按这个顺序完成首次部署
 
@@ -120,7 +119,7 @@ flowchart LR
   </div>
   <div class="relay-boundary">
     <h3>这里的 Pages 只提供文档</h3>
-    <p>GitHub Pages 托管静态文档，中继程序仍需运行在服务器。当前仓库没有可直接部署的 Cloudflare Worker 中继，边缘方案单独说明。</p>
+    <p>GitHub Pages 托管静态文档；完整中继程序仍需要部署在服务器运行。</p>
   </div>
   <div class="relay-boundary">
     <h3>带宽按账号双向共享</h3>

@@ -88,7 +88,7 @@ func (a *Console) overview(c *gin.Context) {
 		apiUnavailable(c)
 		return
 	}
-	a.r.mu.Lock()
+	a.r.mu.RLock()
 	online, sessions := 0, 0
 	for _, p := range a.r.peers {
 		if u.Role == "admin" || p.ownerID == u.ID {
@@ -101,7 +101,7 @@ func (a *Console) overview(c *gin.Context) {
 			sessions++
 		}
 	}
-	a.r.mu.Unlock()
+	a.r.mu.RUnlock()
 	response := gin.H{"users": users, "devices": devices, "onlineDevices": online, "sessions": sessions, "relay": gin.H{"databaseDriver": a.r.config.driver(), "redisEnabled": a.redis != nil, "admissionRequired": a.r.node.Load().AdmissionKey != "", "bandwidthBitsPerSecond": a.r.node.Load().DefaultBandwidthBitsPerSecond, "uptimeSeconds": int64(time.Since(a.r.startedAt).Seconds())}}
 	if u.Role == "admin" {
 		response["server"] = a.r.metrics.Load()
@@ -326,7 +326,7 @@ func (a *Console) devices(c *gin.Context) {
 		return
 	}
 	items := []deviceView{}
-	a.r.mu.Lock()
+	a.r.mu.RLock()
 	for _, d := range devices {
 		v := deviceView{ID: d.ID, OwnerID: d.OwnerID, Label: d.Label, Disabled: d.Disabled, Online: a.r.peers[d.ID] != nil, CreatedAt: d.CreatedAt, LastSeenAt: d.LastSeenAt}
 		if d.OwnerID != nil {
@@ -334,7 +334,7 @@ func (a *Console) devices(c *gin.Context) {
 		}
 		items = append(items, v)
 	}
-	a.r.mu.Unlock()
+	a.r.mu.RUnlock()
 	listResult(c, items, total, p, n)
 }
 func (a *Console) ownedDevice(c *gin.Context) (Device, bool) {
@@ -564,14 +564,14 @@ func (a *Console) activeSessions(c *gin.Context) {
 	}
 	u := currentUser(c)
 	items := []sessionView{}
-	a.r.mu.Lock()
+	a.r.mu.RLock()
 	for id, s := range a.r.sessions {
 		if !a.visibleSession(u, s) || (q != "" && !strings.Contains(id, q) && !strings.Contains(s.origin, strings.ToUpper(q)) && !strings.Contains(s.owner, strings.ToUpper(q))) {
 			continue
 		}
 		items = append(items, sessionView{id, s.origin, s.owner, s.accepted, s.stage, s.createdAt, s.expires})
 	}
-	a.r.mu.Unlock()
+	a.r.mu.RUnlock()
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].CreatedAt.Equal(items[j].CreatedAt) {
 			return items[i].ID > items[j].ID
@@ -610,7 +610,7 @@ func (a *Console) closeActiveSession(c *gin.Context) {
 	}
 	a.r.mu.Lock()
 	if a.r.sessions[id] == s {
-		delete(a.r.sessions, id)
+		a.r.removeSessionLocked(id)
 		for _, device := range []string{s.origin, s.owner} {
 			if p := a.r.peers[device]; p != nil {
 				p.send(Message{Type: "close", Session: id, Error: "session closed from console"})

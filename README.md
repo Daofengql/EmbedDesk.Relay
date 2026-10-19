@@ -6,8 +6,6 @@
 
 [在线部署文档](https://daofengql.github.io/EmbedDesk.Relay/)涵盖 Docker Compose、Nginx / 宝塔 HTTPS、Linux 单二进制与 systemd，以及配置、备份和升级。文档站使用 VitePress，由 GitHub Pages 自动发布。
 
-Cloudflare Worker / Durable Objects 的边缘数据面设计见 [Cloudflare 中继方案](docs/CloudflareRelay.md)。当前仓库中的 Go 中继仍是完整实现；把 Cloudflare 放在 Go 服务前面只能代理流量，不能把 WebSocket 转发负载从 Go 服务卸载。真正卸载大头流量需要由 Worker / Durable Objects 终止并承载客户端 WebSocket。
-
 ## 项目结构
 
 ```text
